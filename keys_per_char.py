@@ -40,7 +40,7 @@ def on_press(key):
         loop
     )
 
-    # ESC press korle program exit
+    # Exit the program on ESC
     if key == keyboard.Key.esc:
         print("\nESC pressed. Exiting...")
 

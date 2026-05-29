@@ -13,7 +13,7 @@ def on_press(key):
 
     print("Saved:", typed_keys)
 
-    # ESC press korle stop
+    # Stop on ESC
     if key == keyboard.Key.esc:
         return False
 

