@@ -1,3 +1,4 @@
+# ← Console client: basic text chat over WebSocket
 import asyncio
 import websockets
 
@@ -5,18 +6,22 @@ async def receive_messages(websocket):
     while True:
         try:
             message = await websocket.recv()
-            print(f"\nReceived: {message}")
+            print(f"\nFriend: {message}")
+
         except:
-            print("Disconnected from server")
+            print("\nDisconnected from server")
             break
 
 async def send_messages(websocket):
     while True:
-        message = await asyncio.to_thread(input, "Enter message to send: ")
-        await websocket.send(message)
+        message = await asyncio.to_thread(input, "You: ")
+
+        if message.strip() != "":
+            await websocket.send(message)
 
 async def chat():
-    uri = "ws://10.227.197.153:8000/ws"
+
+    uri = "wss://wan-data-t.onrender.com/ws"
 
     async with websockets.connect(uri) as websocket:
 

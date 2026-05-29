@@ -1,0 +1,14 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# PyInstaller build output
+/build/
+/dist/
+
+# Local demo logs
+/demo_log.txt
