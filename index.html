@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAN Chat</title>
+<style>
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: Arial, sans-serif;
+    background: #e5ddd5;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#app {
+    width: 100%;
+    max-width: 820px;
+    height: 96vh;
+    background: white;
+    border-radius: 16px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.15);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* Header */
+#header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 13px 18px;
+    background: #128c7e;
+    color: white;
+}
+#header h2 { flex: 1; font-size: 17px; letter-spacing: 0.3px; }
+
+#status {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    background: rgba(255,255,255,0.2);
+    font-weight: bold;
+}
+#status.connected    { background: #25d366; }
+#status.disconnected { background: #e53935; }
+
+/* Messages */
+#messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: #e5ddd5;
+}
+
+.bubble-wrap {
+    display: flex;
+    flex-direction: column;
+}
+.bubble-wrap.me   { align-items: flex-end; }
+.bubble-wrap.them { align-items: flex-start; }
+
+/* Clickable sender name */
+.sender-name {
+    font-size: 11.5px;
+    font-weight: bold;
+    margin-bottom: 2px;
+    padding: 0 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    transition: opacity 0.15s;
+}
+.sender-name:hover { opacity: 0.75; }
+.sender-name .edit-hint {
+    font-size: 10px;
+    opacity: 0;
+    font-weight: normal;
+    font-style: italic;
+    transition: opacity 0.2s;
+}
+.sender-name:hover .edit-hint { opacity: 1; }
+
+.bubble {
+    max-width: 68%;
+    padding: 8px 12px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.5;
+    word-break: break-word;
+    position: relative;
+}
+.bubble-wrap.me .bubble {
+    background: #dcf8c6;
+    border-bottom-right-radius: 3px;
+}
+.bubble-wrap.them .bubble {
+    background: white;
+    border-bottom-left-radius: 3px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+}
+
+.bubble .time {
+    font-size: 10px;
+    color: #999;
+    display: block;
+    text-align: right;
+    margin-top: 3px;
+}
+
+.system-msg {
+    align-self: center;
+    background: rgba(0,0,0,0.07);
+    color: #555;
+    font-size: 11px;
+    padding: 3px 12px;
+    border-radius: 20px;
+    margin: 4px 0;
+    font-style: italic;
+}
+
+/* Input */
+#inputArea {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-top: 1px solid #e0e0e0;
+    background: #f5f5f5;
+}
+#messageInput {
+    flex: 1;
+    padding: 10px 16px;
+    border: 1px solid #ddd;
+    border-radius: 24px;
+    font-size: 14px;
+    outline: none;
+    background: white;
+}
+#messageInput:focus { border-color: #128c7e; }
+#sendBtn {
+    padding: 10px 20px;
+    background: #128c7e;
+    color: white;
+    border: none;
+    border-radius: 24px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+}
+#sendBtn:hover { background: #0f7b6c; }
+#clearBtn {
+    padding: 10px 14px;
+    background: #eee;
+    border: none;
+    border-radius: 24px;
+    cursor: pointer;
+    font-size: 14px;
+    color: #888;
+}
+#clearBtn:hover { background: #ddd; }
+
+/* Rename Toast */
+#renameToast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: #333;
+    color: white;
+    padding: 8px 18px;
+    border-radius: 24px;
+    font-size: 13px;
+    opacity: 0;
+    transition: all 0.3s;
+    pointer-events: none;
+    z-index: 999;
+}
+#renameToast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+
+/* Rename Modal */
+#renameModal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+#renameModal.hidden { display: none; }
+#renameBox {
+    background: white;
+    border-radius: 16px;
+    padding: 28px 24px;
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+}
+#renameBox h3 { font-size: 17px; color: #128c7e; }
+#renameBox p  { font-size: 13px; color: #777; }
+#renameInput {
+    padding: 10px 14px;
+    border: 2px solid #128c7e;
+    border-radius: 10px;
+    font-size: 15px;
+    outline: none;
+}
+.modal-btns { display: flex; gap: 10px; }
+.modal-btns button {
+    flex: 1;
+    padding: 10px;
+    border: none;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+}
+#renameConfirm { background: #128c7e; color: white; }
+#renameConfirm:hover { background: #0f7b6c; }
+#renameCancel  { background: #eee; color: #555; }
+#renameCancel:hover  { background: #ddd; }
+
+</style>
+</head>
+<body>
+
+<!-- Rename Modal -->
+<div id="renameModal" class="hidden">
+    <div id="renameBox">
+        <h3>✏️ নাম পরিবর্তন করো</h3>
+        <p id="renameDesc">এই sender এর নাম দাও — পরের সব message এ automatically এই নামেই আসবে।</p>
+        <input id="renameInput" type="text" placeholder="নাম লেখো..." maxlength="24" autocomplete="off">
+        <div class="modal-btns">
+            <button id="renameCancel"  onclick="closeRename()">বাতিল</button>
+            <button id="renameConfirm" onclick="confirmRename()">Save করো ✓</button>
+        </div>
+    </div>
+</div>
+
+<!-- Toast -->
+<div id="renameToast"></div>
+
+<!-- App -->
+<div id="app">
+    <div id="header">
+        <h2>💬 WAN Chat</h2>
+        <span id="status">Connecting...</span>
+    </div>
+
+    <div id="messages"></div>
+
+    <div id="inputArea">
+        <input id="messageInput" placeholder="Message লেখো..." autocomplete="off">
+        <button id="clearBtn" onclick="clearHistory()" title="History মুছো">🗑</button>
+        <button id="sendBtn" onclick="sendMessage()">Send ➤</button>
+    </div>
+</div>
+
+<script>
+
+// ─────────────────────────────────────
+// Config
+// ─────────────────────────────────────
+const WS_URL       = "wss://wan-data-t.onrender.com/ws";
+const STORAGE_KEY  = "wan_chat_v2";
+const NAMES_KEY    = "wan_sender_names";   // sid → custom name
+const MY_SID_KEY   = "wan_my_sid";
+
+// ─────────────────────────────────────
+// My Session ID — browser refresh করলেও same থাকে
+// ─────────────────────────────────────
+let mySid = localStorage.getItem(MY_SID_KEY);
+if (!mySid) {
+    mySid = Math.random().toString(36).slice(2, 8).toUpperCase();
+    localStorage.setItem(MY_SID_KEY, mySid);
+}
+
+// ─────────────────────────────────────
+// Sender name mapping: sid → display name
+// ─────────────────────────────────────
+let senderNames = {};
+try {
+    senderNames = JSON.parse(localStorage.getItem(NAMES_KEY)) || {};
+} catch(e) { senderNames = {}; }
+
+function saveSenderNames() {
+    localStorage.setItem(NAMES_KEY, JSON.stringify(senderNames));
+}
+
+// friendCounter: "Friend 1", "Friend 2" ...
+let friendCounter = Object.keys(senderNames).filter(k => k !== mySid).length;
+
+function getDisplayName(sid) {
+    if (sid === mySid) return "তুমি";
+    if (senderNames[sid]) return senderNames[sid];
+    // নতুন sid — default নাম দাও
+    friendCounter++;
+    senderNames[sid] = `Friend ${friendCounter}`;
+    saveSenderNames();
+    return senderNames[sid];
+}
+
+// ─────────────────────────────────────
+// Colors per SID
+// ─────────────────────────────────────
+const COLORS = [
+    "#e53935","#8e24aa","#1e88e5","#f57c00",
+    "#00897b","#d81b60","#5e35b1","#00acc1",
+    "#43a047","#6d4c41","#c0392b","#2980b9"
+];
+const sidColors = {};
+let cidx = 0;
+
+function getColor(sid) {
+    if (!sidColors[sid]) {
+        sidColors[sid] = COLORS[cidx % COLORS.length];
+        cidx++;
+    }
+    return sidColors[sid];
+}
+
+// ─────────────────────────────────────
+// Rename Modal
+// ─────────────────────────────────────
+let renamingSid = null;
+
+function openRename(sid) {
+    renamingSid = sid;
+    const current = senderNames[sid] || "";
+    document.getElementById("renameInput").value = current;
+    document.getElementById("renameDesc").textContent =
+        `"${current}" এর নাম পরিবর্তন করো। পরের সব message এ automatically এই নামে দেখাবে।`;
+    document.getElementById("renameModal").classList.remove("hidden");
+    setTimeout(() => {
+        const inp = document.getElementById("renameInput");
+        inp.focus();
+        inp.select();
+    }, 80);
+}
+
+function closeRename() {
+    document.getElementById("renameModal").classList.add("hidden");
+    renamingSid = null;
+}
+
+function confirmRename() {
+    const newName = document.getElementById("renameInput").value.trim();
+    if (!newName || !renamingSid) return;
+
+    const oldName = senderNames[renamingSid] || renamingSid;
+    senderNames[renamingSid] = newName;
+    saveSenderNames();
+
+    // ── DOM এ সব পুরনো sender-name label update করো ──
+    document.querySelectorAll(`.sender-name[data-sid="${renamingSid}"]`)
+        .forEach(el => {
+            el.childNodes[0].nodeValue = newName + " ";
+        });
+
+    closeRename();
+    showToast(`✓ "${oldName}" → "${newName}" নামে save হয়েছে`);
+}
+
+document.getElementById("renameInput").addEventListener("keydown", e => {
+    if (e.key === "Enter") confirmRename();
+    if (e.key === "Escape") closeRename();
+});
+
+// ─────────────────────────────────────
+// Toast
+// ─────────────────────────────────────
+let toastTimer;
+function showToast(msg) {
+    const t = document.getElementById("renameToast");
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 2500);
+}
+
+// ─────────────────────────────────────
+// Render bubble
+// ─────────────────────────────────────
+function renderBubble(sid, msgText, time, save=true) {
+    const isMe = (sid === mySid);
+    const name  = getDisplayName(sid);
+    const color = getColor(sid);
+    const messagesDiv = document.getElementById("messages");
+
+    const wrap = document.createElement("div");
+    wrap.className = "bubble-wrap " + (isMe ? "me" : "them");
+
+    if (!isMe) {
+        const nameEl = document.createElement("div");
+        nameEl.className = "sender-name";
+        nameEl.setAttribute("data-sid", sid);
+        nameEl.style.color = color;
+        nameEl.title = "Click করে নাম পরিবর্তন করো";
+        // text node + edit hint span
+        nameEl.appendChild(document.createTextNode(name + " "));
+        const hint = document.createElement("span");
+        hint.className = "edit-hint";
+        hint.textContent = "(✏️ rename)";
+        nameEl.appendChild(hint);
+        nameEl.addEventListener("click", () => openRename(sid));
+        wrap.appendChild(nameEl);
+    }
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.innerHTML = escapeHtml(msgText) +
+        `<span class="time">${time}${isMe ? " ✓" : ""}</span>`;
+    wrap.appendChild(bubble);
+
+    messagesDiv.appendChild(wrap);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+    if (save) saveMsg(sid, msgText, time);
+}
+
+function renderSystem(text) {
+    const el = document.createElement("div");
+    el.className = "system-msg";
+    el.textContent = text;
+    document.getElementById("messages").appendChild(el);
+    document.getElementById("messages").scrollTop = 99999;
+}
+
+function escapeHtml(t) {
+    return String(t)
+        .replace(/&/g,"&amp;")
+        .replace(/</g,"&lt;")
+        .replace(/>/g,"&gt;");
+}
+
+function getTime() {
+    return new Date().toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit"});
+}
+
+// ─────────────────────────────────────
+// localStorage
+// ─────────────────────────────────────
+function saveMsg(sid, msg, time) {
+    const saved   = localStorage.getItem(STORAGE_KEY);
+    const history = saved ? JSON.parse(saved) : [];
+    history.push({ sid, msg, time });
+    if (history.length > 300) history.splice(0, history.length - 300);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+}
+
+function loadHistory() {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) return;
+    try {
+        JSON.parse(saved).forEach(m => renderBubble(m.sid, m.msg, m.time, false));
+    } catch(e) {
+        localStorage.removeItem(STORAGE_KEY);
+    }
+}
+
+function clearHistory() {
+    if (!confirm("সব message মুছে ফেলব?")) return;
+    localStorage.removeItem(STORAGE_KEY);
+    document.getElementById("messages").innerHTML = "";
+    renderSystem("History cleared.");
+}
+
+// ─────────────────────────────────────
+// WebSocket
+// ─────────────────────────────────────
+let socket, reconnectTimer;
+const statusEl = document.getElementById("status");
+
+function connect() {
+    statusEl.textContent = "Connecting...";
+    statusEl.className   = "";
+    socket = new WebSocket(WS_URL);
+
+    socket.onopen = () => {
+        statusEl.textContent = "Connected ✓";
+        statusEl.className   = "connected";
+        clearTimeout(reconnectTimer);
+        renderSystem("Server এ connected।");
+    };
+
+    socket.onmessage = (event) => {
+        let data;
+        try { data = JSON.parse(event.data); } catch(e) { data = null; }
+
+        if (data && data.sid && data.msg !== undefined) {
+            // Structured message — নিজের message ignore করো (নিজে already render করেছি)
+            if (data.sid !== mySid) {
+                renderBubble(data.sid, data.msg, data.time || getTime());
+            }
+        } else {
+            // Plain text (tray.py keyboard logger ইত্যাদি)
+            renderBubble("__keyboard__", event.data, getTime());
+        }
+    };
+
+    socket.onclose = () => {
+        statusEl.textContent = "Disconnected";
+        statusEl.className   = "disconnected";
+        renderSystem("Disconnected। ৩ সেকেন্ডে reconnect হবে...");
+        reconnectTimer = setTimeout(connect, 3000);
+    };
+
+    socket.onerror = () => socket.close();
+}
+
+// ─────────────────────────────────────
+// Send
+// ─────────────────────────────────────
+function sendMessage() {
+    const input = document.getElementById("messageInput");
+    const text  = input.value.trim();
+    if (!text) return;
+    if (socket.readyState !== WebSocket.OPEN) {
+        showToast("এখনো connected হয়নি!"); return;
+    }
+    const time = getTime();
+    socket.send(JSON.stringify({ sid: mySid, msg: text, time }));
+    renderBubble(mySid, text, time);
+    input.value = "";
+}
+
+document.getElementById("messageInput").addEventListener("keydown", e => {
+    if (e.key === "Enter") sendMessage();
+});
+
+// ─────────────────────────────────────
+// Init
+// ─────────────────────────────────────
+loadHistory();
+connect();
+
+// "তুমি" কে default name হিসেবে set করো
+if (!senderNames[mySid]) {
+    senderNames[mySid] = "তুমি";
+    saveSenderNames();
+}
+
+</script>
+</body>
+</html>
